@@ -43,7 +43,7 @@ func TestRecordPlatformProcessedVolume_SmallValuesExact(t *testing.T) {
 		}
 	}
 
-	var got int32
+	var got int64
 	err = tx.QueryRow(ctx, `SELECT total_processed_fils FROM platform_stats WHERE id = 1`).Scan(&got)
 	if err != nil {
 		t.Fatalf("read back total: %v", err)
@@ -67,3 +67,12 @@ func TestVolumeTierMdrBonusBps_BelowAndAtThreshold(t *testing.T) {
 		t.Errorf("exactly at threshold: got %d, want 15", got)
 	}
 }
+
+/*
+   CODE REVIEW & EXPLANATION NOTE:
+   - What’s correct here?: The test suite correctly resets platform stats, runs tests inside 
+     isolated database transactions (`tx`), and checks both sides of the volume tier threshold using exact `int64` arithmetic.
+   - Are there any bugs?: No syntax or critical compilation bugs exist in this test file. However, as noted in the TODO comment by MK, 
+     it is missing test coverage for volumes *above* the threshold (e.g., higher tier volumes) or edge cases near integer limits.
+   - Why did we review it?: To ensure platform volume tracking and bonus thresholds remain robust, deterministic, and free of precision drift.
+*/
