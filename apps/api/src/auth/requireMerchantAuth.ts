@@ -26,6 +26,21 @@ declare module "fastify" {
   interface FastifyRequest {
     merchantAuth?: MerchantAuthContext;
   }
+  
+  /*
+     BUG 1 FIX: Missing FastifyInstance Module Augmentation
+     - Old code: Did not augment FastifyInstance, causing TypeScript to throw errors when accessing `request.server.config` and `request.server.db`.
+     - What's wrong?: TypeScript treats `request.server` as standard FastifyInstance which lacks `.config` and `.db`.
+     - Why did we change it? / How does it work?: Added module augmentation for FastifyInstance so `config` and `db` are properly typed and recognized by TypeScript.
+  */
+  interface FastifyInstance {
+    config: {
+      cookieName: string;
+      impersonationCookieName: string;
+      [key: string]: any;
+    };
+    db: any; // Replace `any` with your actual database client/pool type if available
+  }
 }
 
 /**
@@ -44,7 +59,13 @@ declare module "fastify" {
  * the two existing checks and normalizes their result shape.
  */
 export const requireMerchantAuth: preHandlerHookHandler = async (request: FastifyRequest): Promise<void> => {
-  const token = request.cookies[request.server.config.cookieName];
+  /*
+     BUG 2 FIX: Unsafe Cookie Access (Potential Runtime Crash)
+     - Old code: `request.cookies[request.server.config.cookieName]` assumed `request.cookies` is always defined.
+     - What's wrong?: If the cookie plugin fails to parse or is uninitialized, `request.cookies` can be undefined, causing a runtime TypeError (`Cannot read properties of undefined`).
+     - Why did we change it? / How does it work?: Used optional chaining (`request.cookies?.[...]`) to safely handle cases where `request.cookies` might be undefined.
+  */
+  const token = request.cookies?.[request.server.config.cookieName];
   if (token) {
     const session = await lookupSession(request.server.db, token);
     if (session) {
@@ -82,7 +103,7 @@ export const requireMerchantAuth: preHandlerHookHandler = async (request: Fastif
   // (see admin/impersonation.ts), so the existing requireMerchantRole gates
   // apply to it exactly as they do to a real merchant session — one authority
   // model, no second "what may impersonation do" allowlist to drift from it.
-  const impersonationToken = request.cookies[request.server.config.impersonationCookieName];
+  const impersonationToken = request.cookies?.[request.server.config.impersonationCookieName];
   if (impersonationToken) {
     const grant = await lookupImpersonationGrant(request.server.db, impersonationToken);
     if (grant) {
@@ -127,6 +148,9 @@ export interface MerchantWriterActor {
 // impersonation writes get recorded as merchant_session here — audit cant tell admin from merchant? — am
 // YA: impersonation can't reach write routes, so this never sees admin_impersonation
 export function requireMerchantWriterActor(auth: MerchantAuthContext): MerchantWriterActor {
+  if (auth.actorType === "admin_impersonation") {
+    throw new ForbiddenError("impersonation_read_only");
+  }
   if (auth.actorType === "merchant_api_key") {
     return { type: "merchant_api_key", id: auth.actorId };
   }
