@@ -80,6 +80,14 @@ export async function lookupSession(
   rawToken: string,
 ): Promise<AuthenticatedSessionLookup | null> {
   const tokenHash = sha256Hex(rawToken);
+  
+  /* 
+     NOTE / DESIGN EXPLANATION:
+     - Querying `live_sessions` view instead of the raw `sessions` table.
+     - Why?: `live_sessions` is designed as a secure database view that already filters out 
+       revoked, expired, and unauthenticated sessions (e.g., `authenticated = true` and `revoked_at IS NULL`), 
+       keeping this lookup clean and centralized.
+  */
   const result = await pool.query<{
     session_id: string;
     merchant_user_id: string;
