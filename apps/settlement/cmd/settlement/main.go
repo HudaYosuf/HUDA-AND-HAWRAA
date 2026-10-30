@@ -1,9 +1,9 @@
 // Command settlement is apps/settlement's CLI entrypoint:
 //
-//	settlement daemon
-//	settlement run-batch --date=2026-09-09 [--merchant=<uuid>]
-//	settlement rebuild-balances [--merchant=<uuid>]
-//	settlement export-scheme-file --batch=<uuid> --out=<path>
+//  settlement daemon
+//  settlement run-batch --date=2026-09-09 [--merchant=<uuid>]
+//  settlement rebuild-balances [--merchant=<uuid>]
+//  settlement export-scheme-file --batch=<uuid> --out=<path>
 //
 // Every subcommand is CLI-invoked (by a human, by the container's own CMD,
 // or by `docker compose run`). `daemon` additionally starts
@@ -81,13 +81,21 @@ func main() {
 		if err := cfg.RequireInternalToken(); err != nil {
 			log.Fatalf("settlement: %v", err)
 		}
+		
+		/*
+		   BUG / IMPROVEMENT FIX: Goroutine `log.Fatalf` Bypassing Deferred Cleanup
+		   - Old code: Called `log.Fatalf` directly inside the background goroutine if `internalapi.Serve` failed.
+		   - What's wrong?: `log.Fatalf` calls `os.Exit(1)`, which immediately terminates the process and skips all deferred functions in `main()` (such as `defer pool.Close()`).
+		   - Why did we change it? / How does the fix work?: Log the error and cancel the context (or let the main runner handle it) so cleanup routines can execute cleanly, or ensure proper error propagation.
+		*/
 		go func() {
 			if err := internalapi.Serve(ctx, pool, cfg); err != nil {
-				log.Fatalf("settlement daemon: internal api: %v", err)
+				log.Printf("settlement daemon: internal api error: %v", err)
+				// Gracefully stop via context or handle without abrupt os.Exit from goroutine
+				stop()
 			}
 		}()
 
-		// FH: if internalapi fails to bind we log.Fatalf from the goroutine and skip the deferred pool.Close -- ok?
 		scheduler.Run(ctx, pool, cfg)
 
 	case "run-batch":
@@ -151,11 +159,20 @@ func main() {
 				log.Fatalf("settlement rebuild-balances: invalid --merchant: %v", err)
 			}
 			// am: --merchant writes the cache for that one merchant, same as the full rebuild
-			before, err := ledger.RebuildMerchantBalance(ctx, pool, id)
+			rebuilt, err := ledger.RebuildMerchantBalance(ctx, pool, id)
 			if err != nil {
 				log.Fatalf("settlement rebuild-balances: %v", err)
 			}
-			fmt.Printf("rebuild-balances: merchant=%s rebuilt=%d\n", id, before)
+			_, err = pool.Exec(ctx, `
+				INSERT INTO merchant_balances (merchant_id, cached_payable_fils, updated_at)
+				VALUES ($1, $2, now())
+				ON CONFLICT (merchant_id) DO UPDATE
+				  SET cached_payable_fils = $2, updated_at = now()
+			`, id, int64(rebuilt))
+			if err != nil {
+				log.Fatalf("settlement rebuild-balances: write cache: %v", err)
+			}
+			fmt.Printf("rebuild-balances: merchant=%s rebuilt=%d\n", id, rebuilt)
 			return
 		}
 
