@@ -10,7 +10,13 @@ import (
 // TestUpdateLifetimePayoutMonitoringEstimate_SmallValuesExact proves the
 // accumulator is wired correctly: three successive payouts land on the
 // exact sum of their net figures.
-// FH: float32 exact up to 2^24 so small values are fine; big ones drift but nobody reads it
+// 
+// BUG / DESIGN RISK NOTE (FH's comment):
+// - What's wrong?: If `lifetime_net_payout_monitoring_estimate` in the database is stored 
+//   as a float32/real type, it only has exact integer precision up to $2^{24}$ (approx. 16.7 million fils / 167,000 BHD).
+// - Why does it happen?: Floating-point types cannot precisely represent all large integers, causing rounding errors and drift as accumulation grows over time.
+// - What does it break?: Over time, high-volume merchants will experience accumulated rounding errors in their lifetime payout monitoring figures.
+// - How does the fix work?: Money and accumulation figures should always be stored as exact integer types (like `bigint` / `int64` in SQL and `int64` in Go) rather than floats. This test only passes because it tests small values well below the $2^{24}$ threshold.
 func TestUpdateLifetimePayoutMonitoringEstimate_SmallValuesExact(t *testing.T) {
 	pool := mustPool(t)
 	ctx := context.Background()
@@ -28,7 +34,7 @@ func TestUpdateLifetimePayoutMonitoringEstimate_SmallValuesExact(t *testing.T) {
 		}
 	}
 
-	var got float32
+	var got int64
 	err = tx.QueryRow(ctx, `
 		SELECT lifetime_net_payout_monitoring_estimate FROM merchants WHERE id = $1
 	`, merchantID).Scan(&got)
