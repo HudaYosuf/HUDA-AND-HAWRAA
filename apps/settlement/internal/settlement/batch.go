@@ -147,12 +147,12 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 	// event — never from transactions.captured_fils (a running total).
 	rows, err := tx.Query(ctx, `
 		SELECT te.id, te.transaction_id, te.amount_fils, te.occurred_at
-		  FROM transaction_events te
-		  JOIN transactions t ON t.id = te.transaction_id
-		 WHERE t.merchant_id = $1
-		   AND te.event_type IN ('captured', 'partially_captured')
-		   AND te.settlement_batch_id IS NULL
-		   AND te.occurred_at >= $2 AND te.occurred_at < $3
+		 FROM transaction_events te
+		 JOIN transactions t ON t.id = te.transaction_id
+		WHERE t.merchant_id = $1
+		  AND te.event_type IN ('captured', 'partially_captured')
+		  AND te.settlement_batch_id IS NULL
+		  AND te.occurred_at >= $2 AND te.occurred_at < $3
 		 ORDER BY te.transaction_id, te.occurred_at
 		 FOR UPDATE OF te
 	`, merchantID, start, end)
@@ -206,9 +206,13 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		for _, e := range grouped[txnID] {
 			grossForTxn += e.amountFils
 			effectiveMdrBps := EffectiveMdrBpsAt(schedules, e.occurredAt, mdrBps)
-			if effectiveMdrBps -= tierBonusBps; effectiveMdrBps < 0 {
+			
+			// FIXED: Separated compound assignment and if statement for Go syntax compliance
+			effectiveMdrBps -= tierBonusBps
+			if effectiveMdrBps < 0 {
 				effectiveMdrBps = 0
 			}
+			
 			feeForTxn += ComputeSettlementFee(e.amountFils, effectiveMdrBps, discountBps)
 			eventIDs = append(eventIDs, e.id)
 		}
@@ -249,12 +253,29 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 
 	for i, line := range lines {
 		truncated := TruncateToSchemeAmount(line.grossFils)
+		residue := line.grossFils - truncated
+		// amount is numeric(10,2). Store the truncated fils as an exact
+		// two-decimal string. Passing the full 3-decimal BD value makes
+		// Postgres round it up, so the scheme file is higher than our fils.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scheme_export_lines (settlement_batch_id, transaction_id, amount_fils, amount, line_sequence)
 			VALUES ($1, $2, $3, $4, $5)
-		`, batchID, line.transactionID, int64(truncated), SchemeAmountBD(line.grossFils), i+1)
+		`, batchID, line.transactionID, int64(truncated), formatFilsAsTwoDecimalString(truncated), i+1)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: insert scheme export line: %w", err)
+		}
+		if residue > 0 {
+			groupID := uuid.New()
+			_, err = tx.Exec(ctx, `
+				INSERT INTO ledger_entries
+				  (entry_group_id, merchant_id, settlement_batch_id, transaction_id, account_id, direction, amount_fils, occurred_at, description)
+				VALUES
+				  ($1, $2, $3, $4, 'scheme_rounding_residue', 'debit',  $5, now(), 'scheme export rounding residue'),
+				  ($1, $2, $3, $4, 'card_scheme_clearing',    'credit', $5, now(), 'scheme export rounding residue')
+			`, groupID, merchantID, batchID, line.transactionID, int64(residue))
+			if err != nil {
+				return BatchResult{}, fmt.Errorf("settlement: CloseBatch: post scheme residue: %w", err)
+			}
 		}
 	}
 
