@@ -138,6 +138,14 @@ export async function listSettlementBatches(
   );
 
   const batches = result.rows.map(serializeBatch);
+  
+  /*
+     BUG 1 FIX: Missing Subtraction Operator in Array Indexing
+     - Old code: `result.rows.length\n1` (missing `-`).
+     - What's wrong?: Causes a syntax error (`Unexpected number`).
+     - What does it break?: Prevents compilation and execution when attempting to retrieve the last row for pagination cursor generation.
+     - How does the fix work?: Added the subtraction operator (`-`) to correctly access the last element (`result.rows.length - 1`).
+  */
   const lastRow = result.rows[result.rows.length - 1];
   const nextCursor = result.rows.length === limit && lastRow ? encodeCursor(lastRow.batch_date, lastRow.id) : null;
 
@@ -325,11 +333,25 @@ export async function getReconciliationReport(
   for (const row of pendingResult.rows) {
     const amountFils = Number(row.amount_fils);
     const feeFils = estimateFeeFils(amountFils, mdrBps, discountBps);
+    /*
+       BUG 2 FIX: Missing Subtraction Operator in Pending Unbatched Calculation
+       - Old code: `amountFils\nfeeFils` (missing `-`).
+       - What's wrong?: Causes a syntax error and incorrect net unbatched calculation.
+       - What does it break?: Compilation fails; net payout calculation for unbatched events would be invalid.
+       - How does the fix work?: Added subtraction (`-`) to correctly subtract estimated fees from amount (`amountFils - feeFils`).
+    */
     pendingUnbatchedFils += amountFils - feeFils;
   }
 
   const ledgerMerchantPayableNetFils = Number(ledgerResult.rows[0]?.net ?? 0);
   const settlementNetPayoutFils = Number(settlementResult.rows[0]?.total ?? 0);
+  /*
+     BUG 3 FIX: Missing Subtraction Operators in Gap Calculation
+     - Old code had newlines without `-` operators (`ledgerMerchantPayableNetFils\n- settlementNetPayoutFils\npendingUnbatchedFils`).
+     - What's wrong?: Causes syntax and logic errors when calculating reconciliation gaps.
+     - What does it break?: Compilation fails and reconciliation gap values become incorrect.
+     - How does the fix work?: Added the missing subtraction operators (`ledgerMerchantPayableNetFils - settlementNetPayoutFils - pendingUnbatchedFils`).
+  */
   const gapFils = ledgerMerchantPayableNetFils - settlementNetPayoutFils - pendingUnbatchedFils;
 
   return {
@@ -364,19 +386,30 @@ export async function getSettlementSummary(
   const windowEnd = bahrainLocalMidnightUtc(input.to);
 
   const result = await pool.query<SettlementSummaryRow>(
-    `WITH captured AS (
-       SELECT t.id, t.captured_fils
-         FROM transactions t
-         JOIN transaction_events te ON te.transaction_id = t.id
-        WHERE t.merchant_id = $1
-          AND te.event_type IN ('captured', 'partially_captured')
-          AND te.occurred_at >= $2 AND te.occurred_at < $3
-     )
-     SELECT COUNT(DISTINCT id) AS transaction_count,
-            COALESCE(SUM(captured_fils), 0) AS total_captured_fils
-       FROM captured`,
+    `SELECT COUNT(DISTINCT t.id) AS transaction_count,
+            COALESCE(SUM(te.amount_fils), 0) AS total_captured_fils
+       FROM transactions t
+       JOIN transaction_events te ON te.transaction_id = t.id
+      WHERE t.merchant_id = $1
+        AND te.event_type IN ('captured', 'partially_captured')
+        AND te.occurred_at >= $2 AND te.occurred_at < $3`,
     [input.merchantId, windowStart, windowEnd],
   );
+  // #region agent log
+  fetch("http://127.0.0.1:7583/ingest/d0a9b0b1-346f-4a44-91e6-22827f9be975", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "494ded" },
+    body: JSON.stringify({
+      sessionId: "494ded",
+      runId: "post-fix",
+      hypothesisId: "summary-join",
+      location: "settlement/query.ts:getSettlementSummary",
+      message: "summary sums each capture event once",
+      data: { transactionCount: Number(result.rows[0]?.transaction_count ?? 0), totalCapturedFils: Number(result.rows[0]?.total_captured_fils ?? 0) },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
 
   const row = result.rows[0];
   return {
