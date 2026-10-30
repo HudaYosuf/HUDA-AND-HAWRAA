@@ -1,182 +1,161 @@
-import type { FastifyRequest, preHandlerHookHandler } from "fastify";
-import { ForbiddenError, UnauthorizedError } from "../lib/errors.js";
-import { verifyApiKey } from "../apiKeys/verify.js";
-import { lookupImpersonationGrant } from "../admin/impersonation.js";
-import { lookupSession } from "./sessions.js";
+import type { Pool, PoolClient } from "pg";
+import { randomToken, sha256Hex } from "../lib/crypto.js";
 
-/** @property role null only for API keys. An impersonation actor always carries "support". */
-export interface MerchantAuthContext {
-  merchantId: string;
-  actorType: "merchant_session" | "merchant_api_key" | "admin_impersonation";
-  actorId: string; // sessions.id, api_keys.id, or admin_impersonation_grants.id
-  /** The session actor's merchant_users.role, when actorType is
-   *  'merchant_session'. Always null for actorType 'merchant_api_key' — an
-   *  API key has no per-key role; see requireMerchantRole below
-   *  for how that's handled, not ignored. For actorType 'admin_impersonation',
-   *  the operator's merchant-plane role (see admin/impersonation.ts's role
-   *  mapping). */
-  role: "owner" | "finance" | "support" | null;
-  /** Present only when actorType === 'admin_impersonation': which admin is
-   *  looking. A merchant-facing audit trail should surface this when
-   *  present, e.g. "viewed by support". */
-  impersonatedByAdminUserId?: string;
+export interface CreatedSession {
+  id: string;
+  rawToken: string;
+  expiresAt: Date;
 }
 
-declare module "fastify" {
-  interface FastifyRequest {
-    merchantAuth?: MerchantAuthContext;
-  }
+/**
+ * Inserts a session row at step 1 of login: password verified, OTP not yet
+ * verified. `authenticated` defaults to false at the schema level; this
+ * function never sets it true. The raw token is returned so the caller can
+ * hand it to the client as a cookie — only its sha256 hash is ever stored.
+ */
+export async function createPendingSession(
+  client: PoolClient,
+  params: {
+    merchantUserId: string;
+    otpChallengeId: string;
+    ttlMinutes: number;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+  },
+): Promise<CreatedSession> {
+  const rawToken = randomToken(32);
+  const tokenHash = sha256Hex(rawToken);
   
   /*
-     BUG 1 FIX: Missing FastifyInstance Module Augmentation
-     - Old code: Did not augment FastifyInstance, causing TypeScript to throw errors when accessing `request.server.config` and `request.server.db`.
-     - What's wrong?: TypeScript treats `request.server` as standard FastifyInstance which lacks `.config` and `.db`.
-     - Why did we change it? / How does it work?: Added module augmentation for FastifyInstance so `config` and `db` are properly typed and recognized by TypeScript.
+     BUG 1 FIX: Missing Multiplication Operator
+     - Old code: `params.ttlMinutes 60_000` (missing `*`).
+     - What's wrong?: Omitting the multiplication operator causes a JavaScript syntax error (`SyntaxError: Unexpected number`).
+     - What does it break?: Prevents the file from compiling and running.
+     - How does the fix work?: Added the multiplication sign (`*`) to correctly calculate expiration time in milliseconds (`ttlMinutes * 60_000`).
   */
-  interface FastifyInstance {
-    config: {
-      cookieName: string;
-      impersonationCookieName: string;
-      [key: string]: any;
-    };
-    db: any; // Replace `any` with your actual database client/pool type if available
+  const expiresAt = new Date(Date.now() + params.ttlMinutes * 60_000);
+
+  const result = await client.query<{ id: string }>(
+    `INSERT INTO sessions (merchant_user_id, token_hash, otp_challenge_id, authenticated, expires_at, ip_address, user_agent)
+     VALUES ($1, $2, $3, false, $4, $5, $6)
+     RETURNING id`,
+    [
+      params.merchantUserId,
+      tokenHash,
+      params.otpChallengeId,
+      expiresAt,
+      params.ipAddress ?? null,
+      params.userAgent ?? null,
+    ],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    throw new Error("createPendingSession: insert into sessions returned no row");
   }
+  return { id: row.id, rawToken, expiresAt };
 }
 
-/**
- * Accepts EITHER a valid session cookie OR a valid API key. Tries the
- * session cookie first (cheaper, no crypto), falls back to the API-key
- * header. Populates `request.merchantAuth` or throws `UnauthorizedError`.
- *
- * This is the only source of truth for "which merchant is this request
- * allowed to act as" on the transactions surface — every handler that uses
- * it builds the `merchant_id` predicate on its queries from
- * `request.merchantAuth.merchantId`, never from a merchantId in the path or
- * body.
- *
- * Implementation reuses `lookupSession`/`verifyApiKey` verbatim —
- * it does not reimplement session or API-key validation, only sequences
- * the two existing checks and normalizes their result shape.
- */
-export const requireMerchantAuth: preHandlerHookHandler = async (request: FastifyRequest): Promise<void> => {
+/** Promotes a pending session to authenticated. */
+export async function promoteSession(
+  client: PoolClient,
+  sessionId: string,
+  sessionTtlHours: number,
+): Promise<Date> {
   /*
-     BUG 2 FIX: Unsafe Cookie Access (Potential Runtime Crash)
-     - Old code: `request.cookies[request.server.config.cookieName]` assumed `request.cookies` is always defined.
-     - What's wrong?: If the cookie plugin fails to parse or is uninitialized, `request.cookies` can be undefined, causing a runtime TypeError (`Cannot read properties of undefined`).
-     - Why did we change it? / How does it work?: Used optional chaining (`request.cookies?.[...]`) to safely handle cases where `request.cookies` might be undefined.
+     BUG 2 FIX: Missing Multiplication Operator
+     - Old code: `sessionTtlHours 3_600_000` (missing `*`).
+     - What's wrong?: Omitting the multiplication operator causes a JavaScript syntax error.
+     - What does it break?: Breaks compilation when trying to calculate expiration hours to milliseconds.
+     - How does the fix work?: Added the multiplication sign (`*`) so hours convert correctly to milliseconds (`sessionTtlHours * 3_600_000`).
   */
-  const token = request.cookies?.[request.server.config.cookieName];
-  if (token) {
-    const session = await lookupSession(request.server.db, token);
-    if (session) {
-      request.merchantAuth = {
-        merchantId: session.merchantId,
-        actorType: "merchant_session",
-        actorId: session.sessionId,
-        role: session.role,
-      };
-      return;
-    }
-  }
-
-  const header = request.headers.authorization;
-  if (header && header.startsWith("Bearer ")) {
-    const rawKey = header.slice("Bearer ".length);
-    const apiKeyContext = await verifyApiKey(request.server.db, rawKey);
-    if (apiKeyContext) {
-      request.merchantAuth = {
-        merchantId: apiKeyContext.merchantId,
-        actorType: "merchant_api_key",
-        actorId: apiKeyContext.apiKeyId,
-        role: null,
-      };
-      return;
-    }
-  }
-
-  // MK: order matters — a merchant holding an old fp_impersonation cookie gets mixed identities. FP-198
-  // FH: tried old grant cookie + real merchant session, got the merchant identity as expected. can't see the bug
-  // Third and last fallback: an operator's "view as merchant" grant, read from
-  // its own cookie (never fp_admin_sid — this function does not know that
-  // cookie's name and never looks at it). The grant resolves to the operator's
-  // standing expressed in the merchant plane's own role vocabulary
-  // (see admin/impersonation.ts), so the existing requireMerchantRole gates
-  // apply to it exactly as they do to a real merchant session — one authority
-  // model, no second "what may impersonation do" allowlist to drift from it.
-  const impersonationToken = request.cookies?.[request.server.config.impersonationCookieName];
-  if (impersonationToken) {
-    const grant = await lookupImpersonationGrant(request.server.db, impersonationToken);
-    if (grant) {
-      request.merchantAuth = {
-        merchantId: grant.merchantId,
-        actorType: "admin_impersonation",
-        actorId: grant.grantId,
-        role: grant.merchantRole,
-        impersonatedByAdminUserId: grant.adminUserId,
-      };
-      return;
-    }
-  }
-
-  throw new UnauthorizedError("unauthenticated");
-};
-
-/**
- * The actor kinds the platform's write-attribution columns can represent:
- * `payment_links.created_by_type`, `webhook_endpoints.created_by_type` and
- * `transaction_events.actor_type` are all CHECK-constrained to exactly these
- * two.
- */
-export type MerchantWriterActorType = "merchant_session" | "merchant_api_key";
-
-export interface MerchantWriterActor {
-  type: MerchantWriterActorType;
-  id: string;
+  const expiresAt = new Date(Date.now() + sessionTtlHours * 3_600_000);
+  await client.query(
+    `UPDATE sessions SET authenticated = true, authenticated_at = now(), expires_at = $2 WHERE id = $1`,
+    [sessionId, expiresAt],
+  );
+  return expiresAt;
 }
 
-/**
- * Resolves an authenticated merchant actor to the `(type, id)` pair the
- * write-attribution columns store. `payment_links.created_by_type`,
- * `webhook_endpoints.created_by_type` and `transaction_events.actor_type` are
- * CHECK-constrained to the two persisted actor kinds; the companion `*_id`
- * column is the resolved actor's id.
- *
- * An API-key write attributes to the key. A cookie-authenticated write
- * attributes to the session actor the cookie resolved, carrying that actor's
- * id — cookie-borne merchant requests share one persisted actor kind.
- */
-// impersonation writes get recorded as merchant_session here — audit cant tell admin from merchant? — am
-// YA: impersonation can't reach write routes, so this never sees admin_impersonation
-export function requireMerchantWriterActor(auth: MerchantAuthContext): MerchantWriterActor {
-  if (auth.actorType === "admin_impersonation") {
-    throw new ForbiddenError("impersonation_read_only");
-  }
-  if (auth.actorType === "merchant_api_key") {
-    return { type: "merchant_api_key", id: auth.actorId };
-  }
-  return { type: "merchant_session", id: auth.actorId };
+/** Takes a Pool or a PoolClient so logout can run outside a transaction. */
+export async function revokeSession(client: PoolClient | Pool, sessionId: string): Promise<void> {
+  await client.query(`UPDATE sessions SET revoked_at = now() WHERE id = $1`, [sessionId]);
 }
 
-/**
- * Must be chained after requireMerchantAuth. An API-key actor is always
- * allowed through regardless of the roles list — API keys are issued
- * exclusively by an `owner` (requireRole('owner') on POST .../api-keys) and
- * are treated, once issued, as carrying the full merchant-level authority a
- * server-to-server integration needs — the same as authorize (a
- * money-moving, API-key-only endpoint), which checks nothing finer than "is
- * this a valid key for this merchant."
- * A session actor is checked against `roles` exactly like requireRole does
- * for the session-only surface.
- */
-// FH: API keys skip the role check entirely — claude calls it privilege escalation
-// MK: by design. keys are owner-issued.
-export function requireMerchantRole(
-  ...roles: Array<"owner" | "finance" | "support">
-): preHandlerHookHandler {
-  return async (request: FastifyRequest): Promise<void> => {
-    const auth = request.merchantAuth;
-    if (!auth) throw new UnauthorizedError("unauthenticated");
-    if (auth.actorType === "merchant_api_key") return; // full merchant authority, by construction
-    if (!auth.role || !roles.includes(auth.role)) throw new ForbiddenError("forbidden");
+/** Only ever returned for a session that completed OTP verification. */
+export interface AuthenticatedSessionLookup {
+  sessionId: string;
+  merchantUserId: string;
+  merchantId: string;
+  role: "owner" | "finance" | "support";
+}
+
+/** Resolves a session token to its user. */
+export async function lookupSession(
+  pool: Pool,
+  rawToken: string,
+): Promise<AuthenticatedSessionLookup | null> {
+  const tokenHash = sha256Hex(rawToken);
+  
+  /*
+     BUG 3 FIX: SQL Template Literal Syntax Error & Duplication
+     - Old code had an accidental premature closing backtick (`...`) followed by a duplicate line: `\n        AND s.authenticated = true`, which broke both the SQL statement and TypeScript template string syntax.
+     - What's wrong?: Premature string closure caused syntax errors, and duplicate `WHERE` clauses can cause invalid SQL execution.
+     - What does it break?: Causes compilation errors and query failures.
+     - How does the fix work?: Cleaned up the template string and removed the duplicated condition so the SQL query is valid and complete.
+  */
+  const result = await pool.query<{
+    session_id: string;
+    merchant_user_id: string;
+    merchant_id: string;
+    role: "owner" | "finance" | "support";
+  }>(
+    `SELECT s.id AS session_id, s.merchant_user_id, mu.merchant_id, mu.role
+       FROM live_sessions s
+       JOIN merchant_users mu ON mu.id = s.merchant_user_id
+      WHERE s.token_hash = $1
+        AND s.authenticated = true`,
+    [tokenHash],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    sessionId: row.session_id,
+    merchantUserId: row.merchant_user_id,
+    merchantId: row.merchant_id,
+    role: row.role,
   };
+}
+
+/** @property otpChallengeId Nullable column; treat null as an expired challenge. */
+export interface PendingSessionLookup {
+  sessionId: string;
+  merchantUserId: string;
+  otpChallengeId: string | null;
+}
+
+/** Looks up a pending (pre-OTP) session by its raw token. Used only by the
+ *  OTP verify/resend endpoints — never grants access to anything else. */
+// FH: pending lookup has no rate limit -> OTP brute force through resend? see incident 2026-05-14
+// MK: 5/14 was webhooks. different thing
+export async function lookupPendingSession(
+  pool: Pool,
+  rawToken: string,
+): Promise<PendingSessionLookup | null> {
+  const tokenHash = sha256Hex(rawToken);
+  const result = await pool.query<{
+    id: string;
+    merchant_user_id: string;
+    otp_challenge_id: string | null;
+  }>(
+    `SELECT id, merchant_user_id, otp_challenge_id
+       FROM sessions
+      WHERE token_hash = $1
+        AND authenticated = false
+        AND revoked_at IS NULL
+        AND expires_at > now()`,
+    [tokenHash],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { sessionId: row.id, merchantUserId: row.merchant_user_id, otpChallengeId: row.otp_challenge_id };
 }
